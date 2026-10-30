@@ -11,8 +11,8 @@ pub(super) struct SubscriptionHealth {
 impl SubscriptionHealth {
     pub(super) fn sent(&mut self, sub: &str, replay_floor: Option<u64>) {
         // Repeated overflow/retry REQs must not keep an unconfirmed subscription
-        // alive forever. EOSE carries only the stable subscription ID, so this
-        // verifies a response for that ID, not each superseded REQ individually.
+        // alive forever. The caller rejects EOSE for IDs reused on this socket:
+        // only a fresh connection can unambiguously confirm their replacement.
         self.pending
             .entry(sub.to_owned())
             .and_modify(|(_, floor)| {

@@ -1355,12 +1355,19 @@ impl BgState {
     /// EOSE may belong to the superseded REQ, whose replacement (e.g. an
     /// overflow-recovery replay) has not delivered its history yet.
     fn note_eose(&mut self, sub_id: &str) {
+        if self.superseded_this_conn.contains(sub_id) {
+            // The EOSE may be for the earlier REQ. Keep both the health
+            // deadline and replay floor until a fresh socket removes ambiguity.
+            debug!(
+                subscription_id = sub_id,
+                "ignoring ambiguous superseded EOSE"
+            );
+            return;
+        }
         if self.subscription_health.remove(sub_id) {
             info!(subscription_id = sub_id, "subscription EOSE confirmed");
         }
-        if !self.superseded_this_conn.contains(sub_id) {
-            self.retired_loss_this_conn.remove(sub_id);
-        }
+        self.retired_loss_this_conn.remove(sub_id);
     }
 
     /// A REQ was written for `sub_id`. A second REQ on the same connection
@@ -1369,8 +1376,8 @@ impl BgState {
     /// subscription's loss record right after this. Retain its requested floor
     /// too: partial history can advance last_seen before EOSE, and a deadline
     /// reconnect must still cover the unfinished replay.
-    fn note_req_sent(&mut self, sub_id: &str, replay_floor: u64) {
-        self.subscription_health.sent(sub_id, Some(replay_floor));
+    fn note_req_sent(&mut self, sub_id: &str, replay_floor: Option<u64>) {
+        self.subscription_health.sent(sub_id, replay_floor);
         let loss = if sub_id == MEMBERSHIP_NOTIF_SUB_ID {
             self.membership_dropped_since
         } else {
@@ -3538,7 +3545,7 @@ async fn send_subscribe(
         Ok(text) => {
             match ws_send_timeout(ws, Message::Text(text.into()), WS_SEND_TIMEOUT_SECS).await {
                 Ok(()) => {
-                    state.note_req_sent(&sub_id, since.unwrap_or(since_ts));
+                    state.note_req_sent(&sub_id, Some(since.unwrap_or(since_ts)));
                     debug!(
                         "subscribed to channel {channel_id}{}",
                         if since.is_some() {
@@ -3594,7 +3601,7 @@ async fn send_membership_subscribe(
         Ok(text) => {
             match ws_send_timeout(ws, Message::Text(text.into()), WS_SEND_TIMEOUT_SECS).await {
                 Ok(()) => {
-                    state.note_req_sent(MEMBERSHIP_NOTIF_SUB_ID, since.unwrap_or(since_ts));
+                    state.note_req_sent(MEMBERSHIP_NOTIF_SUB_ID, Some(since.unwrap_or(since_ts)));
                     debug!("subscribed to membership notifications (since={since_ts})");
                     true
                 }
@@ -3634,9 +3641,7 @@ async fn send_observer_control_subscribe(
         Ok(text) => {
             match ws_send_timeout(ws, Message::Text(text.into()), WS_SEND_TIMEOUT_SECS).await {
                 Ok(()) => {
-                    state
-                        .subscription_health
-                        .sent(OBSERVER_CONTROL_SUB_ID, None);
+                    state.note_req_sent(OBSERVER_CONTROL_SUB_ID, None);
                     debug!("subscribed to observer control frames");
                     true
                 }

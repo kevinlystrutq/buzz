@@ -122,7 +122,7 @@ async fn heartbeat(peer: &mut Peer, listener: &tokio::net::TcpListener) -> usize
 async fn missing_eose_recovers_and_confirmed_reconnect_stays_live() {
     // The fake relay ignores one replayed REQ in the recovery case. Both cases
     // must ultimately deliver on a confirmed socket without restarting the owner.
-    for confirm_replay in [true, false] {
+    for (confirm_replay, supersede) in [(true, false), (false, false), (true, true)] {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("ws://{}", listener.local_addr().unwrap());
         let keys = Keys::generate();
@@ -196,14 +196,35 @@ async fn missing_eose_recovers_and_confirmed_reconnect_stays_live() {
                 .is_none(),
             "connection-loss sentinel"
         );
+        if supersede {
+            commands
+                .send(RelayCommand::Subscribe {
+                    channel_id: channel,
+                    filter: ChannelFilter {
+                        kinds: Some(vec![9]),
+                        require_mention: true,
+                    },
+                    replay_since: Some(1_000),
+                })
+                .await
+                .unwrap();
+            let replacement = request(&mut peer).await;
+            assert_eq!(
+                replacement, replay,
+                "replacement deliberately reuses the same ID"
+            );
+        }
         if confirm_replay {
+            // In the superseded case, this is the delayed EOSE for the earlier
+            // REQ. Its identical subscription ID cannot confirm the replacement.
             peer.send(Message::Text(json!(["EOSE", sub]).to_string().into()))
                 .await
                 .unwrap();
         }
         // Wait for paced resubscribe to return to the real read/select loop.
         let mut pings = barrier(&mut peer, &listener).await;
-        if !confirm_replay {
+        let needs_recovery = !confirm_replay || supersede;
+        if needs_recovery {
             // History can arrive newest first. Even with partial delivery, a
             // deadline reconnect must retain the unfinished replay's old floor.
             let partial = send_mention(&mut peer, &sub, channel, &agent, 1_000).await;
@@ -270,9 +291,9 @@ async fn missing_eose_recovers_and_confirmed_reconnect_stays_live() {
         assert_eq!(delivered.event.id, final_event.id);
         assert_eq!(
             delivered.connection_generation,
-            if confirm_replay { 1 } else { 2 }
+            if needs_recovery { 2 } else { 1 }
         );
-        println!("confirm_replay={confirm_replay}: recovery={} then 180s confirmed stability, {pings} pings; signed mention delivered on generation {}", !confirm_replay, delivered.connection_generation);
+        println!("confirm_replay={confirm_replay}, supersede={supersede}: recovery={needs_recovery} then 180s confirmed stability, {pings} pings; signed mention delivered on generation {}", delivered.connection_generation);
         commands.send(RelayCommand::Shutdown).await.unwrap();
         timeout(Duration::from_secs(3), owner)
             .await
@@ -298,6 +319,40 @@ async fn response(ws: &mut WsStream, state: &mut BgState, message: Value) {
         )
         .await
     );
+}
+
+#[tokio::test]
+async fn earlier_eose_cannot_confirm_a_superseded_request() {
+    for kind in 0..3 {
+        let (mut client, mut peer) = super::tests::test_ws_pair().await;
+        let mut state = BgState::new();
+        let channel = Uuid::new_v4();
+        let command = || match kind {
+            0 => RelayCommand::Subscribe {
+                channel_id: channel,
+                filter: super::tests::test_channel_filter(),
+                replay_since: Some(1_000),
+            },
+            1 => RelayCommand::SubscribeMembership,
+            _ => RelayCommand::SubscribeObserverControls,
+        };
+        assert!(execute_connected_command(&mut client, &mut state, "agent", command()).await);
+        let earlier = request(&mut peer).await;
+        let deadline = state.subscription_health.deadline();
+        assert!(deadline.is_some());
+        assert!(execute_connected_command(&mut client, &mut state, "agent", command()).await);
+        let replacement = request(&mut peer).await;
+        assert_eq!(
+            earlier[1], replacement[1],
+            "both requests reuse the wire ID"
+        );
+        response(&mut client, &mut state, json!(["EOSE", earlier[1]])).await;
+        assert_eq!(
+            state.subscription_health.deadline(),
+            deadline,
+            "an earlier EOSE must not clear the replacement deadline (kind {kind})"
+        );
+    }
 }
 
 #[tokio::test]
@@ -330,7 +385,24 @@ async fn channel_and_control_deadlines_follow_written_requests_and_terminal_resp
         response(&mut client, &mut state, json!(["EOSE", "unrelated"])).await;
         assert_eq!(state.subscription_health.deadline(), Some(first_deadline));
         response(&mut client, &mut state, json!(["EOSE", sub])).await;
-        assert!(state.subscription_health.deadline().is_none());
+        assert_eq!(
+            state.subscription_health.deadline(),
+            Some(first_deadline),
+            "ambiguous EOSE must retain the replacement deadline"
+        );
+        // Even another EOSE cannot prove which request completed: an old query
+        // can be cancelled without an EOSE, so response counting is unsafe.
+        response(&mut client, &mut state, json!(["EOSE", sub])).await;
+        assert_eq!(state.subscription_health.deadline(), Some(first_deadline));
+        state.note_connection_closed();
+        (client, peer) = super::tests::test_ws_pair().await;
+        assert!(execute_connected_command(&mut client, &mut state, "agent", command()).await);
+        request(&mut peer).await;
+        response(&mut client, &mut state, json!(["EOSE", sub])).await;
+        assert!(
+            state.subscription_health.deadline().is_none(),
+            "fresh socket is unambiguous"
+        );
 
         assert!(execute_connected_command(&mut client, &mut state, "agent", command()).await);
         request(&mut peer).await;
