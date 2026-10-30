@@ -68,7 +68,7 @@ Output varies by command group — `--help` shows flags but not response shapes.
 | `mem set/patch/rm` | nothing to stdout; progress to stderr |
 | `mem ls` | tab-delimited (`slug\tcreated_at\tevent_id`) by default; `--json` for JSON array |
 | `sidebar sections list` | `{sections: [{id, name, icon?, order}], assignments: {channel_id: section_id}}` |
-| `sidebar sort list` | `{default: "alpha", groups: {group_key: "alpha"\|"recent"}}` — only groups with a mode set; keys are `starred`, `channels`, `forums`, `dms`, `section:<id>` |
+| `sidebar sort list` | `{default: "alpha", groups: {group_key: "alpha"\|"recent"}}` — only groups with a mode set; keys are `starred`, `channels`, `forums`, `dms`, `section:<id>`, and any other key another client stored |
 | `sidebar stars list`, `sidebar mutes list` | `{channels: [channel_id]}` — only channels that are set |
 | `sidebar projects list` | `{projects: ["30621:<owner>:<d>"]}` — only pinned projects |
 | `sidebar sections/sort/stars/mutes/projects` writes | `{event_id, accepted, message}` (`sort` adds `group`); `message: "unchanged"` and `event_id: null` when nothing was published |
