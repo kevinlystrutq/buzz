@@ -2373,35 +2373,12 @@ fn write_restriction_denial(
 /// by its owner's (`users.agent_owner_pubkey`). A ban is normally enforced by
 /// the auth seam and the live disconnect; this gate is the durable backstop
 /// for a missed disconnect and for HTTP writes. A timeout has no auth-seam
-/// presence, so this is where it is enforced. Fails closed on a DB error.
+/// presence, so this is where it is enforced. It runs per write, so it reads
+/// through [`AppState::restriction_state_cached`]: a restriction change takes
+/// effect within [`crate::state::RESTRICTION_CACHE_MAX_AGE`]. The verdict is
+/// still taken at `now`, so a cached timeout lifts on time. Fails closed on a
+/// DB error.
 pub(crate) async fn enforce_write_restriction(
-    state: &AppState,
-    tenant: &TenantContext,
-    kind: u32,
-    pubkey: &nostr::PublicKey,
-) -> Result<(), IngestError> {
-    #[cfg(test)]
-    crate::nip_fi_test_hooks::before_write_ban_check(tenant.community()).await;
-    let restriction = state
-        .db
-        .moderation_restriction_state(tenant.community(), pubkey.as_bytes())
-        .await
-        .map_err(|e| {
-            IngestError::ban(
-                BanRefusal::Unavailable,
-                IngestError::Internal(format!(
-                    "error: internal error checking restriction state: {e}"
-                )),
-            )
-        })?;
-    write_restriction_denial(kind, &restriction, Utc::now()).map_or(Ok(()), Err)
-}
-
-/// [`enforce_write_restriction`] over a 30-second cached restriction row, for
-/// the WebSocket ephemeral and observer paths. Those run per typing pulse and
-/// observer frame; persistent ingest keeps the uncached read. The verdict is
-/// still taken at `now`, so a cached timeout lifts on time.
-pub(crate) async fn enforce_cached_write_restriction(
     state: &AppState,
     tenant: &TenantContext,
     kind: u32,

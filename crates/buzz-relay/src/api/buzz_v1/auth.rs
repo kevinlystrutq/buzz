@@ -168,8 +168,7 @@ pub(super) async fn recheck(
     #[cfg(test)]
     crate::nip_fi_test_hooks::before_http_ban_recheck(principal.tenant.community()).await;
     let restrictions = state
-        .db
-        .moderation_restriction_state(principal.tenant.community(), &principal.actor.to_bytes())
+        .restriction_state_cached(principal.tenant.community(), &principal.actor.to_bytes())
         .await
         .map_err(|_| refuse(DenialClass::AuthorizationUnavailable, Error::unavailable()))?;
     if restrictions.banned {
