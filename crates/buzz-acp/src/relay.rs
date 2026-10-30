@@ -1231,6 +1231,9 @@ struct BgState {
     /// A single failed channel REQ is parked here instead of aborting the whole
     /// reconnect. Drained by the main loop. Flushed on each reconnect attempt.
     resubscribe_retry: HashSet<Uuid>,
+    /// Written REQs awaiting EOSE on the current socket. A healthy Pong is not
+    /// subscription confirmation; a missing EOSE forces bounded recovery.
+    subscription_health: subscription_health::SubscriptionHealth,
     /// Current authenticated WebSocket generation. Incremented immediately
     /// after each successful reconnect handshake, before buffered or live
     /// events from the new connection are forwarded.
@@ -1292,6 +1295,7 @@ impl BgState {
             observer_in_flight: VecDeque::new(),
             gated_observer_dropped: 0,
             resubscribe_retry: HashSet::new(),
+            subscription_health: subscription_health::SubscriptionHealth::default(),
             connection_generation: 0,
             backoff_step: 0,
             retired_loss_this_conn: HashMap::new(),
@@ -1351,17 +1355,29 @@ impl BgState {
     /// EOSE may belong to the superseded REQ, whose replacement (e.g. an
     /// overflow-recovery replay) has not delivered its history yet.
     fn note_eose(&mut self, sub_id: &str) {
-        if !self.superseded_this_conn.contains(sub_id) {
-            self.retired_loss_this_conn.remove(sub_id);
+        if self.superseded_this_conn.contains(sub_id) {
+            // The EOSE may be for the earlier REQ. Keep both the health
+            // deadline and replay floor until a fresh socket removes ambiguity.
+            debug!(
+                subscription_id = sub_id,
+                "ignoring ambiguous superseded EOSE"
+            );
+            return;
         }
+        if self.subscription_health.remove(sub_id) {
+            info!(subscription_id = sub_id, "subscription EOSE confirmed");
+        }
+        self.retired_loss_this_conn.remove(sub_id);
     }
 
     /// A REQ was written for `sub_id`. A second REQ on the same connection
     /// supersedes the first for the rest of that connection (see
     /// `superseded_this_conn`). A caller that wrote a replay REQ retires the
-    /// subscription's loss record right after this, so the record is kept in
-    /// `retired_loss_this_conn` until the replay is known to have finished.
-    fn note_req_sent(&mut self, sub_id: &str) {
+    /// subscription's loss record right after this. Retain its requested floor
+    /// too: partial history can advance last_seen before EOSE, and a deadline
+    /// reconnect must still cover the unfinished replay.
+    fn note_req_sent(&mut self, sub_id: &str, replay_floor: Option<u64>) {
+        self.subscription_health.sent(sub_id, replay_floor);
         let loss = if sub_id == MEMBERSHIP_NOTIF_SUB_ID {
             self.membership_dropped_since
         } else {
@@ -1383,7 +1399,13 @@ impl BgState {
     /// never reached a counted EOSE are restored, merged by `min` with any
     /// newer loss. Idempotent for the same outage.
     fn note_connection_closed(&mut self) {
-        for (sub_id, loss) in std::mem::take(&mut self.retired_loss_this_conn) {
+        // An unfinished query can have advanced last_seen with only part of
+        // its history. Restore its requested floor as well as recorded overflow.
+        let retired = std::mem::take(&mut self.retired_loss_this_conn);
+        for (sub_id, loss) in retired
+            .into_iter()
+            .chain(self.subscription_health.take_replay_floors())
+        {
             if sub_id == MEMBERSHIP_NOTIF_SUB_ID {
                 self.membership_dropped_since =
                     Some(self.membership_dropped_since.map_or(loss, |d| d.min(loss)));
@@ -1402,6 +1424,8 @@ impl BgState {
     /// Prevents stale replay on re-subscribe and avoids unbounded state growth
     /// for channels that are removed and never re-added.
     fn clear_channel_state(&mut self, channel_id: &Uuid) {
+        self.subscription_health
+            .remove(&channel_sub_id(*channel_id));
         self.recovery
             .last_attempt
             .remove(&channel_sub_id(*channel_id));
@@ -1768,7 +1792,7 @@ async fn execute_connected_command(
                 state.observer_resub_needed = true;
                 return true;
             }
-            let sent = send_observer_control_subscribe(ws, agent_pubkey_hex).await;
+            let sent = send_observer_control_subscribe(ws, state, agent_pubkey_hex).await;
             if sent {
                 state.observer_resub_needed = false;
                 true
@@ -1969,7 +1993,8 @@ async fn run_background_task(
                     }
                 }
                 if state.observer_resub_needed && budget > 0 {
-                    if send_observer_control_subscribe(&mut ws, &agent_pubkey_hex).await {
+                    if send_observer_control_subscribe(&mut ws, &mut state, &agent_pubkey_hex).await
+                    {
                         state.observer_resub_needed = false;
                         budget = budget.saturating_sub(1);
                         any_sent = true;
@@ -2020,11 +2045,31 @@ async fn run_background_task(
         }
 
         let recovery_at = recovery::ready_at(&mut state);
+        let subscription_deadline = state.subscription_health.deadline();
         tokio::select! {
                    _ = recovery::ready(&event_tx, recovery_at) => {
                        recovery::recover_one(&mut ws, &mut state, &event_tx, &agent_pubkey_hex).await;
                    }
-                   raw = ws.next() => {
+                   raw = async {
+                       tokio::select! {
+                           // An expired deadline must win even under continuous
+                           // inbound traffic from other, healthy subscriptions.
+                           biased;
+                           _ = subscription_health::wait(subscription_deadline) => None,
+                           raw = ws.next() => Some(raw),
+                       }
+                   } => {
+                       let raw = match raw {
+                           Some(raw) => raw,
+                           None => {
+                               warn!(
+                                   subscriptions = ?state.subscription_health.expired(),
+                                   timeout_secs = subscription_health::EOSE_TIMEOUT.as_secs(),
+                                   "subscription EOSE deadline expired — reconnecting"
+                               );
+                               None // Use the existing socket-loss recovery path.
+                           }
+                       };
                        // Determine if the socket is lost.
                        let socket_lost = match raw {
                            Some(Ok(msg)) => {
@@ -2485,6 +2530,9 @@ async fn handle_ws_message(
                     subscription_id,
                     message,
                 } => {
+                    // CLOSED terminates this REQ. Parked retries get a new
+                    // deadline only once their replacement REQ is written.
+                    state.subscription_health.remove(&subscription_id);
                     // A per-channel membership denial means THIS channel is
                     // forbidden, not the whole connection. Drop just this
                     // channel's subscription and keep the socket — otherwise the
@@ -2543,7 +2591,8 @@ async fn handle_ws_message(
                     // resubscribe_after_reconnect() needs the subscription to
                     // still be in state so it can restore it.
                     if subscription_id == OBSERVER_CONTROL_SUB_ID {
-                        let sent = send_observer_control_subscribe(ws, agent_pubkey_hex).await;
+                        let sent =
+                            send_observer_control_subscribe(ws, state, agent_pubkey_hex).await;
                         if sent {
                             state.observer_control_sub_active = true;
                         } else {
@@ -2877,7 +2926,7 @@ async fn resubscribe_after_reconnect(
             if !pacing_sleep(cmd_rx, &mut deferred_commands, REQ_PACING_INTERVAL).await {
                 return ResubscribeResult::Shutdown;
             }
-            if !send_observer_control_subscribe(ws, agent_pubkey_hex).await {
+            if !send_observer_control_subscribe(ws, state, agent_pubkey_hex).await {
                 warn!("failed to resubscribe observer controls after reconnect");
                 retain_deferred_command_intent(state, &mut deferred_commands);
                 return ResubscribeResult::RetryConnection;
@@ -3496,7 +3545,7 @@ async fn send_subscribe(
         Ok(text) => {
             match ws_send_timeout(ws, Message::Text(text.into()), WS_SEND_TIMEOUT_SECS).await {
                 Ok(()) => {
-                    state.note_req_sent(&sub_id);
+                    state.note_req_sent(&sub_id, Some(since.unwrap_or(since_ts)));
                     debug!(
                         "subscribed to channel {channel_id}{}",
                         if since.is_some() {
@@ -3552,7 +3601,7 @@ async fn send_membership_subscribe(
         Ok(text) => {
             match ws_send_timeout(ws, Message::Text(text.into()), WS_SEND_TIMEOUT_SECS).await {
                 Ok(()) => {
-                    state.note_req_sent(MEMBERSHIP_NOTIF_SUB_ID);
+                    state.note_req_sent(MEMBERSHIP_NOTIF_SUB_ID, Some(since.unwrap_or(since_ts)));
                     debug!("subscribed to membership notifications (since={since_ts})");
                     true
                 }
@@ -3570,7 +3619,11 @@ async fn send_membership_subscribe(
 }
 
 /// Send a NIP-01 REQ for owner-to-agent observer control frames.
-async fn send_observer_control_subscribe(ws: &mut WsStream, agent_pubkey_hex: &str) -> bool {
+async fn send_observer_control_subscribe(
+    ws: &mut WsStream,
+    state: &mut BgState,
+    agent_pubkey_hex: &str,
+) -> bool {
     let req = json!([
         "REQ",
         OBSERVER_CONTROL_SUB_ID,
@@ -3588,6 +3641,7 @@ async fn send_observer_control_subscribe(ws: &mut WsStream, agent_pubkey_hex: &s
         Ok(text) => {
             match ws_send_timeout(ws, Message::Text(text.into()), WS_SEND_TIMEOUT_SECS).await {
                 Ok(()) => {
+                    state.note_req_sent(OBSERVER_CONTROL_SUB_ID, None);
                     debug!("subscribed to observer control frames");
                     true
                 }
@@ -4377,12 +4431,16 @@ async fn wait_for_any_ok(
 }
 
 mod recovery;
+mod subscription_health;
 
 #[cfg(test)]
 mod recovery_tests;
 
 #[cfg(test)]
 mod resume_tests;
+
+#[cfg(test)]
+mod subscription_deadline_tests;
 
 #[cfg(test)]
 mod tests {
